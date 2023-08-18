@@ -51,13 +51,25 @@ GL_REPOSTING_CHUNK = 100
 
 @frappe.whitelist()
 def get_fiscal_year(
-	date=None, fiscal_year=None, label="Date", verbose=1, company=None, as_dict=False
+	date=None, fiscal_year=None, label="Date", verbose=1, company=None, as_dict=False, boolean=False
 ):
-	return get_fiscal_years(date, fiscal_year, label, verbose, company, as_dict=as_dict)[0]
+	fiscal_years = get_fiscal_years(
+		date, fiscal_year, label, verbose, company, as_dict=as_dict, boolean=boolean
+	)
+	if boolean:
+		return fiscal_years
+	else:
+		return fiscal_years[0]
 
 
 def get_fiscal_years(
-	transaction_date=None, fiscal_year=None, label="Date", verbose=1, company=None, as_dict=False
+	transaction_date=None,
+	fiscal_year=None,
+	label="Date",
+	verbose=1,
+	company=None,
+	as_dict=False,
+	boolean=False,
 ):
 	fiscal_years = frappe.cache().hget("fiscal_years", company) or []
 
@@ -121,8 +133,12 @@ def get_fiscal_years(
 	if company:
 		error_msg = _("""{0} for {1}""").format(error_msg, frappe.bold(company))
 
+	if boolean:
+		return False
+
 	if verbose == 1:
 		frappe.msgprint(error_msg)
+
 	raise FiscalYearError(error_msg)
 
 
@@ -443,6 +459,9 @@ def reconcile_against_document(args, skip_ref_details_update_for_pe=False):  # n
 			# update ref in advance entry
 			if voucher_type == "Journal Entry":
 				update_reference_in_journal_entry(entry, doc, do_not_save=True)
+				# advance section in sales/purchase invoice and reconciliation tool,both pass on exchange gain/loss
+				# amount and account in args
+				doc.make_exchange_gain_loss_journal(args)
 			else:
 				update_reference_in_payment_entry(
 					entry, doc, do_not_save=True, skip_ref_details_update_for_pe=skip_ref_details_update_for_pe
@@ -554,7 +573,11 @@ def update_reference_in_journal_entry(d, journal_entry, do_not_save=False):
 	# new row with references
 	new_row = journal_entry.append("accounts")
 
-	new_row.update((frappe.copy_doc(jv_detail)).as_dict())
+	# Copy field values into new row
+	[
+		new_row.set(field, jv_detail.get(field))
+		for field in frappe.get_meta("Journal Entry Account").get_fieldnames_with_value()
+	]
 
 	new_row.set(d["dr_or_cr"], d["allocated_amount"])
 	new_row.set(
@@ -592,9 +615,7 @@ def update_reference_in_payment_entry(
 		"total_amount": d.grand_total,
 		"outstanding_amount": d.outstanding_amount,
 		"allocated_amount": d.allocated_amount,
-		"exchange_rate": d.exchange_rate
-		if not d.exchange_gain_loss
-		else payment_entry.get_exchange_rate(),
+		"exchange_rate": d.exchange_rate if d.exchange_gain_loss else payment_entry.get_exchange_rate(),
 		"exchange_gain_loss": d.exchange_gain_loss,  # only populated from invoice in case of advance allocation
 	}
 
@@ -618,28 +639,43 @@ def update_reference_in_payment_entry(
 	payment_entry.flags.ignore_validate_update_after_submit = True
 	payment_entry.setup_party_account_field()
 	payment_entry.set_missing_values()
-	payment_entry.set_amounts()
-
-	if d.difference_amount and d.difference_account:
-		account_details = {
-			"account": d.difference_account,
-			"cost_center": payment_entry.cost_center
-			or frappe.get_cached_value("Company", payment_entry.company, "cost_center"),
-		}
-		if d.difference_amount:
-			account_details["amount"] = d.difference_amount
-
-		payment_entry.set_gain_or_loss(account_details=account_details)
-
-	payment_entry.flags.ignore_validate_update_after_submit = True
-	payment_entry.setup_party_account_field()
-	payment_entry.set_missing_values()
 	if not skip_ref_details_update_for_pe:
 		payment_entry.set_missing_ref_details()
 	payment_entry.set_amounts()
+	payment_entry.make_exchange_gain_loss_journal()
 
 	if not do_not_save:
 		payment_entry.save(ignore_permissions=True)
+
+
+def cancel_exchange_gain_loss_journal(parent_doc: dict | object) -> None:
+	"""
+	Cancel Exchange Gain/Loss for Sales/Purchase Invoice, if they have any.
+	"""
+	if parent_doc.doctype in ["Sales Invoice", "Purchase Invoice", "Payment Entry", "Journal Entry"]:
+		journals = frappe.db.get_all(
+			"Journal Entry Account",
+			filters={
+				"reference_type": parent_doc.doctype,
+				"reference_name": parent_doc.name,
+				"docstatus": 1,
+			},
+			fields=["parent"],
+			as_list=1,
+		)
+
+		if journals:
+			gain_loss_journals = frappe.db.get_all(
+				"Journal Entry",
+				filters={
+					"name": ["in", [x[0] for x in journals]],
+					"voucher_type": "Exchange Gain Or Loss",
+					"docstatus": 1,
+				},
+				as_list=1,
+			)
+			for doc in gain_loss_journals:
+				frappe.get_doc("Journal Entry", doc[0]).cancel()
 
 
 def unlink_ref_doc_from_payment_entries(ref_doc):
@@ -831,7 +867,7 @@ def get_held_invoices(party_type, party):
 
 	if party_type == "Supplier":
 		held_invoices = frappe.db.sql(
-			"select name from `tabPurchase Invoice` where release_date IS NOT NULL and release_date > CURDATE()",
+			"select name from `tabPurchase Invoice` where on_hold = 1 and release_date IS NOT NULL and release_date > CURDATE()",
 			as_dict=1,
 		)
 		held_invoices = set(d["name"] for d in held_invoices)
@@ -1088,6 +1124,12 @@ def get_autoname_with_number(number_value, doc_title, company):
 		parts.insert(0, cstr(number_value).strip())
 
 	return " - ".join(parts)
+
+
+def parse_naming_series_variable(doc, variable):
+	if variable == "FY":
+		date = doc.get("posting_date") or doc.get("transaction_date") or getdate()
+		return get_fiscal_year(date=date, company=doc.get("company"))[0]
 
 
 @frappe.whitelist()
@@ -1386,6 +1428,50 @@ def check_and_delete_linked_reports(report):
 	if icons:
 		for icon in icons:
 			frappe.delete_doc("Desktop Icon", icon)
+
+
+def create_err_and_its_journals(companies: list = None) -> None:
+	if companies:
+		for company in companies:
+			err = frappe.new_doc("Exchange Rate Revaluation")
+			err.company = company.name
+			err.posting_date = nowdate()
+			err.rounding_loss_allowance = 0.0
+
+			err.fetch_and_calculate_accounts_data()
+			if err.accounts:
+				err.save().submit()
+				response = err.make_jv_entries()
+
+				if company.submit_err_jv:
+					jv = response.get("revaluation_jv", None)
+					jv and frappe.get_doc("Journal Entry", jv).submit()
+					jv = response.get("zero_balance_jv", None)
+					jv and frappe.get_doc("Journal Entry", jv).submit()
+
+
+def auto_create_exchange_rate_revaluation_daily() -> None:
+	"""
+	Executed by background job
+	"""
+	companies = frappe.db.get_all(
+		"Company",
+		filters={"auto_exchange_rate_revaluation": 1, "auto_err_frequency": "Daily"},
+		fields=["name", "submit_err_jv"],
+	)
+	create_err_and_its_journals(companies)
+
+
+def auto_create_exchange_rate_revaluation_weekly() -> None:
+	"""
+	Executed by background job
+	"""
+	companies = frappe.db.get_all(
+		"Company",
+		filters={"auto_exchange_rate_revaluation": 1, "auto_err_frequency": "Weekly"},
+		fields=["name", "submit_err_jv"],
+	)
+	create_err_and_its_journals(companies)
 
 
 def get_payment_ledger_entries(gl_entries, cancel=0):
@@ -1741,3 +1827,74 @@ class QueryPaymentLedger(object):
 		self.query_for_outstanding()
 
 		return self.voucher_outstandings
+
+
+def create_gain_loss_journal(
+	company,
+	party_type,
+	party,
+	party_account,
+	gain_loss_account,
+	exc_gain_loss,
+	dr_or_cr,
+	reverse_dr_or_cr,
+	ref1_dt,
+	ref1_dn,
+	ref1_detail_no,
+	ref2_dt,
+	ref2_dn,
+	ref2_detail_no,
+) -> str:
+	journal_entry = frappe.new_doc("Journal Entry")
+	journal_entry.voucher_type = "Exchange Gain Or Loss"
+	journal_entry.company = company
+	journal_entry.posting_date = nowdate()
+	journal_entry.multi_currency = 1
+
+	party_account_currency = frappe.get_cached_value("Account", party_account, "account_currency")
+
+	if not gain_loss_account:
+		frappe.throw(_("Please set default Exchange Gain/Loss Account in Company {}").format(company))
+	gain_loss_account_currency = get_account_currency(gain_loss_account)
+	company_currency = frappe.get_cached_value("Company", company, "default_currency")
+
+	if gain_loss_account_currency != company_currency:
+		frappe.throw(_("Currency for {0} must be {1}").format(gain_loss_account, company_currency))
+
+	journal_account = frappe._dict(
+		{
+			"account": party_account,
+			"party_type": party_type,
+			"party": party,
+			"account_currency": party_account_currency,
+			"exchange_rate": 0,
+			"cost_center": erpnext.get_default_cost_center(company),
+			"reference_type": ref1_dt,
+			"reference_name": ref1_dn,
+			"reference_detail_no": ref1_detail_no,
+			dr_or_cr: abs(exc_gain_loss),
+			dr_or_cr + "_in_account_currency": 0,
+		}
+	)
+
+	journal_entry.append("accounts", journal_account)
+
+	journal_account = frappe._dict(
+		{
+			"account": gain_loss_account,
+			"account_currency": gain_loss_account_currency,
+			"exchange_rate": 1,
+			"cost_center": erpnext.get_default_cost_center(company),
+			"reference_type": ref2_dt,
+			"reference_name": ref2_dn,
+			"reference_detail_no": ref2_detail_no,
+			reverse_dr_or_cr + "_in_account_currency": 0,
+			reverse_dr_or_cr: abs(exc_gain_loss),
+		}
+	)
+
+	journal_entry.append("accounts", journal_account)
+
+	journal_entry.save()
+	journal_entry.submit()
+	return journal_entry.name
